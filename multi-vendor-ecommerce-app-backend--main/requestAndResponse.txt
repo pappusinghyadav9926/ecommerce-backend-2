@@ -1,0 +1,560 @@
+====================================================================================================
+RESUME PROJECT SPECIFICATION & API DOCUMENTATION
+Project Title: Scalable Multi-Vendor E-Commerce Data Access Layer
+Tech Stack: Java 17, Spring Boot 3.4.2, Hibernate Core (JPA 3.1 Provider), PostgreSQL (Neon Cloud), HikariCP, JUnit 5, Spring Cache
+Database: PostgreSQL 16.x (Neon Cloud Live: jdbc:postgresql://ep-shy-violet-azhr40cb-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+1. ARCHITECTURAL OVERVIEW & KEY HIBERNATE FEATURES SHOWCASED
+----------------------------------------------------------------------------------------------------
+
+1. Bidirectional Mappings:
+   - User (Parent) <---> @OneToOne(mappedBy = "user", cascade = CascadeType.ALL) <---> CustomerProfile (Child)
+   - Category (Parent) <---> @OneToMany(mappedBy = "category", cascade = CascadeType.ALL) <---> Product (Child)
+   - Vendor (Parent) <---> @OneToMany(mappedBy = "vendor", cascade = CascadeType.ALL) <---> Product (Child)
+   - Product (Owning) <---> @ManyToMany(via @JoinTable(name = "cart_product")) <---> Cart (Non-Owning)
+   - Order (Parent) <---> @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true) <---> OrderItem (Child)
+
+2. Soft Deletes (@SQLDelete & @SQLRestriction):
+   - Products are annotated with:
+     @SQLDelete(sql = "UPDATE product SET is_deleted = true WHERE id = ?")
+     @SQLRestriction("is_deleted = false")
+   - When product.deleteById(id) is invoked, Hibernate intercepts the operation and issues an UPDATE SQL query instead of a physical SQL DELETE. Active JPQL and Spring Data repository queries automatically filter out soft-deleted items while preserving historical OrderItem records intact.
+
+3. Batch Processing (Bulk Seller Upload Optimization):
+   - Configured JDBC Batching in application.properties:
+     hibernate.jdbc.batch_size=50
+     hibernate.order_inserts=true
+     hibernate.order_updates=true
+   - ProductService.saveBatchProducts iterates over product requests, invokes entityManager.persist(product), and executes entityManager.flush() and entityManager.clear() every 50 records.
+   - Prevents OutOfMemory exceptions and groups single SQL INSERT statements into batch SQL executions sent over JDBC.
+
+4. Orphan Removal (Automatic Cleanup):
+   - Configured @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true) on Order.orderItems.
+   - When an OrderItem is removed from the order.getOrderItems() collection, Hibernate dirty-checking detects the dereferenced entity and issues an automatic SQL DELETE statement:
+     DELETE FROM order_item WHERE id = ?
+
+5. N+1 Problem Solution in Order Retrieval (Interview Challenge):
+   - Challenge: Default lazy loading inside loops when fetching a customer's order history generated 1 SQL query for Orders + N queries for OrderItems + M queries for Products (1 + N + M total queries).
+   - Solution: Replaced lazy loop fetching with JPQL JOIN FETCH in OrderRepository:
+     "SELECT DISTINCT o FROM Order o JOIN FETCH o.orderItems oi JOIN FETCH oi.product WHERE o.customer.id = :customerId"
+   - Result: Consolidates query execution into 1 single optimized SQL JOIN statement.
+
+6. Database Indexing & Caching:
+   - Indexing: @Table(name = "product", indexes = {@Index(name = "idx_product_name", columnList = "name"), @Index(name = "idx_product_category", columnList = "category_id"), @Index(name = "idx_product_vendor", columnList = "vendor_id"), @Index(name = "idx_product_price", columnList = "price")}).
+   - Indexing: @Table(name = "orders", indexes = {@Index(name = "idx_order_customer", columnList = "customer_id"), @Index(name = "idx_order_status", columnList = "status")}).
+   - Spring Cache: @EnableCaching with @Cacheable(value = "products", key = "#id") and @CacheEvict(value = "products", key = "#id").
+
+
+
+----------------------------------------------------------------------------------------------------
+2. AUTOMATICALLY INITIALIZED SAMPLE DATA (INDIAN E-COMMERCE SEED DATA)
+----------------------------------------------------------------------------------------------------
+1. Customers:
+   - Rahul Sharma (Bengaluru, Karnataka | Phone: +91 98765 43210 | User ID: 1)
+   - Priya Patel (Ahmedabad, Gujarat | Phone: +91 98123 45678 | User ID: 2)
+   - Amit Verma (New Delhi, Delhi | Phone: +91 99887 76655 | User ID: 3)
+
+2. Sellers / Vendors:
+   - Bharat Electronics Ltd (Code: VEND-IND-001 | Bengaluru)
+   - Jaipur Ethnic Crafts (Code: VEND-IND-002 | Jaipur)
+   - Desi Home & Spices (Code: VEND-IND-003 | New Delhi)
+
+3. Product Catalog (Prices in INR ₹):
+   - boAt Airdopes 141 TWS Earbuds (₹1,299.00 | Electronics)
+   - OnePlus Nord CE 3 Lite 5G (₹17,999.00 | Electronics)
+   - Pure Chanderi Silk Saree with Zari Border (₹3,499.00 | Fashion)
+   - Men's Cotton Lucknawi Chikankari Kurta Set (₹1,899.00 | Fashion)
+   - Prestige Deluxe Alpha Stainless Steel Pressure Cooker 3L (₹2,150.00 | Home)
+   - Pure Copper Water Bottle 1000ml (₹799.00 | Home)
+   - Organic Kashmir Saffron / Kesar 1 Gram Pack (₹499.00 | Spices)
+
+4. Initial Orders:
+   - ORD-IND-1001 (Customer: Rahul Sharma | Items: boAt Earbuds x2, Copper Bottle x1 | Total: ₹3,397.00)
+   - ORD-IND-1002 (Customer: Priya Patel | Items: Chanderi Silk Saree x1 | Total: ₹3,499.00)
+
+
+----------------------------------------------------------------------------------------------------
+3. API REQUEST & RESPONSE CATALOG WITH SAMPLE OBJECTS
+----------------------------------------------------------------------------------------------------
+
+====================================================================================================
+API 1: Create User & Customer Profile (@OneToOne Bidirectional Mapping)
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/users
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "username": "alex_seller",
+  "email": "alex.seller@example.com",
+  "password": "SecurePassword123!",
+  "role": "CUSTOMER",
+  "firstName": "Alex",
+  "lastName": "Morgan",
+  "phone": "+1-555-0199",
+  "shippingAddress": "742 Evergreen Terrace",
+  "city": "Springfield",
+  "state": "OR",
+  "zipCode": "97477",
+  "country": "USA"
+}
+
+--- SAMPLE RESPONSE OBJECT (201 Created) ---
+{
+  "id": 1,
+  "username": "alex_seller",
+  "email": "alex.seller@example.com",
+  "role": "CUSTOMER",
+  "profile": {
+    "profileId": 1,
+    "firstName": "Alex",
+    "lastName": "Morgan",
+    "phone": "+1-555-0199",
+    "shippingAddress": "742 Evergreen Terrace",
+    "city": "Springfield",
+    "state": "OR",
+    "zipCode": "97477",
+    "country": "USA"
+  }
+}
+
+====================================================================================================
+API 2: Get User Profile by ID
+====================================================================================================
+HTTP Method: GET
+URL: http://localhost:8080/api/users/1
+Headers: Accept: application/json
+
+--- SAMPLE RESPONSE OBJECT (200 OK) ---
+{
+  "id": 1,
+  "username": "alex_seller",
+  "email": "alex.seller@example.com",
+  "role": "CUSTOMER",
+  "profile": {
+    "profileId": 1,
+    "firstName": "Alex",
+    "lastName": "Morgan",
+    "phone": "+1-555-0199",
+    "shippingAddress": "742 Evergreen Terrace",
+    "city": "Springfield",
+    "state": "OR",
+    "zipCode": "97477",
+    "country": "USA"
+  }
+}
+
+====================================================================================================
+API 3: Create Seller Vendor
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/vendors
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "storeName": "TechGadgets Direct",
+  "sellerCode": "VEND-TECH-001",
+  "contactEmail": "support@techgadgets.com",
+  "phoneNumber": "+1-800-555-0144"
+}
+
+--- SAMPLE RESPONSE OBJECT (201 Created) ---
+{
+  "id": 1,
+  "storeName": "TechGadgets Direct",
+  "sellerCode": "VEND-TECH-001",
+  "contactEmail": "support@techgadgets.com",
+  "phoneNumber": "+1-800-555-0144",
+  "rating": 5.0,
+  "totalProducts": 0
+}
+
+====================================================================================================
+API 4: Create Product Category
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/categories
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "name": "Audio & Electronics",
+  "description": "Premium wireless headphones, earbuds, and audio gear"
+}
+
+--- SAMPLE RESPONSE OBJECT (201 Created) ---
+{
+  "id": 1,
+  "name": "Audio & Electronics",
+  "description": "Premium wireless headphones, earbuds, and audio gear"
+}
+
+====================================================================================================
+API 5: Create Single Product
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/products
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "name": "Pro Noise-Cancelling Headphones",
+  "sku": "SKU-HEADPHONE-PRO-100",
+  "description": "Over-ear active noise cancelling bluetooth headphones with 30hr battery",
+  "price": 249.99,
+  "stockQuantity": 150,
+  "categoryId": 1,
+  "vendorId": 1
+}
+
+--- SAMPLE RESPONSE OBJECT (201 Created) ---
+{
+  "id": 1,
+  "name": "Pro Noise-Cancelling Headphones",
+  "sku": "SKU-HEADPHONE-PRO-100",
+  "description": "Over-ear active noise cancelling bluetooth headphones with 30hr battery",
+  "price": 249.99,
+  "stockQuantity": 150,
+  "isDeleted": false,
+  "categoryId": 1,
+  "categoryName": "Audio & Electronics",
+  "vendorId": 1,
+  "storeName": "TechGadgets Direct"
+}
+
+====================================================================================================
+API 6: Bulk Upload Products (Seller Batch Uploading 10,000 Items)
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/products/batch
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "products": [
+    {
+      "name": "Ergonomic Mechanical Keyboard",
+      "sku": "SKU-KEYBOARD-RGB-01",
+      "description": "Tactile RGB mechanical keyboard",
+      "price": 119.99,
+      "stockQuantity": 80,
+      "categoryId": 1,
+      "vendorId": 1
+    },
+    {
+      "name": "Precision Gaming Mouse",
+      "sku": "SKU-MOUSE-PRECISION-02",
+      "description": "16000 DPI optical gaming mouse",
+      "price": 59.99,
+      "stockQuantity": 200,
+      "categoryId": 1,
+      "vendorId": 1
+    }
+  ]
+}
+
+--- SAMPLE RESPONSE OBJECT (201 Created) ---
+[
+  {
+    "id": 2,
+    "name": "Ergonomic Mechanical Keyboard",
+    "sku": "SKU-KEYBOARD-RGB-01",
+    "description": "Tactile RGB mechanical keyboard",
+    "price": 119.99,
+    "stockQuantity": 80,
+    "isDeleted": false,
+    "categoryId": 1,
+    "categoryName": "Audio & Electronics",
+    "vendorId": 1,
+    "storeName": "TechGadgets Direct"
+  },
+  {
+    "id": 3,
+    "name": "Precision Gaming Mouse",
+    "sku": "SKU-MOUSE-PRECISION-02",
+    "description": "16000 DPI optical gaming mouse",
+    "price": 59.99,
+    "stockQuantity": 200,
+    "isDeleted": false,
+    "categoryId": 1,
+    "categoryName": "Audio & Electronics",
+    "vendorId": 1,
+    "storeName": "TechGadgets Direct"
+  }
+]
+
+====================================================================================================
+API 7: Paginated Product Catalog Search & Filtering
+====================================================================================================
+HTTP Method: GET
+URL: http://localhost:8080/api/products?page=0&size=10&categoryId=1&minPrice=50.00&maxPrice=300.00&search=Headphones&sortBy=price&sortDir=asc
+Headers: Accept: application/json
+
+--- SAMPLE RESPONSE OBJECT (200 OK) ---
+{
+  "content": [
+    {
+      "id": 1,
+      "name": "Pro Noise-Cancelling Headphones",
+      "sku": "SKU-HEADPHONE-PRO-100",
+      "description": "Over-ear active noise cancelling bluetooth headphones with 30hr battery",
+      "price": 249.99,
+      "stockQuantity": 150,
+      "isDeleted": false,
+      "categoryId": 1,
+      "categoryName": "Audio & Electronics",
+      "vendorId": 1,
+      "storeName": "TechGadgets Direct"
+    }
+  ],
+  "pageable": {
+    "pageNumber": 0,
+    "pageSize": 10,
+    "sort": {
+      "empty": false,
+      "sorted": true,
+      "unsorted": false
+    },
+    "offset": 0,
+    "paged": true,
+    "unpaged": false
+  },
+  "totalPages": 1,
+  "totalElements": 1,
+  "last": true,
+  "size": 10,
+  "number": 0,
+  "numberOfElements": 1,
+  "first": true,
+  "empty": false
+}
+
+====================================================================================================
+API 8: Soft Delete Product (@SQLDelete Showcase)
+====================================================================================================
+HTTP Method: DELETE
+URL: http://localhost:8080/api/products/1
+
+--- SAMPLE RESPONSE (204 No Content) ---
+(Empty Response Body)
+
+====================================================================================================
+API 9: Add Product to Cart (@ManyToMany Mapping)
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/cart/items
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "customerProfileId": 1,
+  "productId": 2
+}
+
+--- SAMPLE RESPONSE OBJECT (200 OK) ---
+{
+  "cartId": 1,
+  "customerProfileId": 1,
+  "products": [
+    {
+      "id": 2,
+      "name": "Ergonomic Mechanical Keyboard",
+      "sku": "SKU-KEYBOARD-RGB-01",
+      "description": "Tactile RGB mechanical keyboard",
+      "price": 119.99,
+      "stockQuantity": 80,
+      "isDeleted": false,
+      "categoryId": 1,
+      "categoryName": "Audio & Electronics",
+      "vendorId": 1,
+      "storeName": "TechGadgets Direct"
+    }
+  ],
+  "totalItems": 1
+}
+
+====================================================================================================
+API 10: Place Order (CascadeType.ALL Order to OrderItems)
+====================================================================================================
+HTTP Method: POST
+URL: http://localhost:8080/api/orders
+Headers: Content-Type: application/json
+
+--- SAMPLE REQUEST OBJECT ---
+{
+  "customerProfileId": 1,
+  "items": [
+    {
+      "productId": 2,
+      "quantity": 1
+    },
+    {
+      "productId": 3,
+      "quantity": 2
+    }
+  ]
+}
+
+--- SAMPLE RESPONSE OBJECT (201 Created) ---
+{
+  "id": 1,
+  "orderNumber": "ORD-B47A9C12",
+  "customerProfileId": 1,
+  "customerName": "Alex Morgan",
+  "totalAmount": 239.97,
+  "status": "PENDING",
+  "orderDate": "2026-07-25T13:40:00",
+  "items": [
+    {
+      "itemId": 1,
+      "productId": 2,
+      "productName": "Ergonomic Mechanical Keyboard",
+      "productSku": "SKU-KEYBOARD-RGB-01",
+      "quantity": 1,
+      "unitPrice": 119.99,
+      "subtotal": 119.99
+    },
+    {
+      "itemId": 2,
+      "productId": 3,
+      "productName": "Precision Gaming Mouse",
+      "productSku": "SKU-MOUSE-PRECISION-02",
+      "quantity": 2,
+      "unitPrice": 59.99,
+      "subtotal": 119.98
+    }
+  ]
+}
+
+====================================================================================================
+API 11: Get Customer Orders (JPQL JOIN FETCH N+1 Solution Showcase)
+====================================================================================================
+HTTP Method: GET
+URL: http://localhost:8080/api/orders/customer/1
+Headers: Accept: application/json
+
+--- SAMPLE RESPONSE OBJECT (200 OK) ---
+[
+  {
+    "id": 1,
+    "orderNumber": "ORD-B47A9C12",
+    "customerProfileId": 1,
+    "customerName": "Alex Morgan",
+    "totalAmount": 239.97,
+    "status": "PENDING",
+    "orderDate": "2026-07-25T13:40:00",
+    "items": [
+      {
+        "itemId": 1,
+        "productId": 2,
+        "productName": "Ergonomic Mechanical Keyboard",
+        "productSku": "SKU-KEYBOARD-RGB-01",
+        "quantity": 1,
+        "unitPrice": 119.99,
+        "subtotal": 119.99
+      },
+      {
+        "itemId": 2,
+        "productId": 3,
+        "productName": "Precision Gaming Mouse",
+        "productSku": "SKU-MOUSE-PRECISION-02",
+        "quantity": 2,
+        "unitPrice": 59.99,
+        "subtotal": 119.98
+      }
+    ]
+  }
+]
+
+====================================================================================================
+API 12: Remove Item from Order (Orphan Removal Showcase)
+====================================================================================================
+HTTP Method: DELETE
+URL: http://localhost:8080/api/orders/1/items/1
+Headers: Accept: application/json
+
+--- SAMPLE RESPONSE OBJECT (200 OK) ---
+{
+  "id": 1,
+  "orderNumber": "ORD-B47A9C12",
+  "customerProfileId": 1,
+  "customerName": "Alex Morgan",
+  "totalAmount": 119.98,
+  "status": "PENDING",
+  "orderDate": "2026-07-25T13:40:00",
+  "items": [
+    {
+      "itemId": 2,
+      "productId": 3,
+      "productName": "Precision Gaming Mouse",
+      "productSku": "SKU-MOUSE-PRECISION-02",
+      "quantity": 2,
+      "unitPrice": 59.99,
+      "subtotal": 119.98
+    }
+  ]
+}
+
+
+----------------------------------------------------------------------------------------------------
+3. STEP-BY-STEP CODE EXECUTION FLOW
+----------------------------------------------------------------------------------------------------
+
+SCENARIO 1: User Registration & Customer Profile Creation (@OneToOne)
+  1. Client sends POST to /api/users with UserDTO.Request payload.
+  2. UserController intercepts request and invokes UserService.createUser(request).
+  3. UserService constructs User and CustomerProfile entities, linking them via user.setCustomerProfile(profile).
+  4. UserRepository.save(user) is invoked.
+  5. JPA/Hibernate Persistence Context persists both User and CustomerProfile in a single transaction via CascadeType.ALL.
+  6. MySQL executes 2 SQL INSERT queries:
+     - INSERT INTO users (username, email, password, role, created_at) VALUES (?, ?, ?, ?, ?);
+     - INSERT INTO customer_profile (first_name, last_name, phone, shipping_address, city, state, zip_code, country, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+SCENARIO 2: Bulk Product Upload (Batch Processing Optimization)
+  1. Seller submits POST to /api/products/batch with a list of product requests.
+  2. ProductController calls ProductService.saveBatchProducts(requests).
+  3. ProductService loops over the requests and persists products using entityManager.persist(product).
+  4. Every 50 iterations (matching hibernate.jdbc.batch_size=50), ProductService calls:
+     - entityManager.flush() -> Flushes pending inserts to database batch queue.
+     - entityManager.clear() -> Clears persistence context to free heap memory.
+  5. MySQL JDBC Driver receives batched INSERT commands:
+     - INSERT INTO product (name, sku, description, price, stock_quantity, category_id, vendor_id, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?); [Batch of 50]
+
+SCENARIO 3: Soft Product Deletion (@SQLDelete)
+  1. Client sends DELETE request to /api/products/{id}.
+  2. ProductController delegates to ProductService.deleteProduct(id).
+  3. ProductService calls ProductRepository.deleteById(id).
+  4. Hibernate intercepts deleteById and inspects @SQLDelete annotation on Product entity.
+  5. Instead of issuing "DELETE FROM product WHERE id = ?", Hibernate executes:
+     - UPDATE product SET is_deleted = true WHERE id = ?;
+  6. Historical order items referencing this product remain safe. Subsequent product searches automatically append "WHERE is_deleted = false" due to @SQLRestriction.
+
+SCENARIO 4: Placing an Order & Orphan Removal
+  1. Client sends POST to /api/orders.
+  2. OrderController calls OrderService.createOrder(request).
+  3. OrderService fetches customer and products, calculates subtotals, constructs OrderItem entities, and attaches them to Order via order.addOrderItem(item).
+  4. OrderRepository.save(order) cascades persist to OrderItems (CascadeType.ALL).
+  5. When client deletes an item via DELETE /api/orders/{orderId}/items/{orderItemId}, OrderService invokes order.removeOrderItem(item).
+  6. Hibernate dirty checker notices the OrderItem removed from order.getOrderItems() collection and issues:
+     - DELETE FROM order_item WHERE id = ?; (Triggered by orphanRemoval = true).
+
+SCENARIO 5: N+1 Solution in Order History Retrieval (JPQL JOIN FETCH)
+  1. Client calls GET /api/orders/customer/{customerId}.
+  2. OrderController delegates to OrderService.getOrdersByCustomerId(customerId).
+  3. OrderService calls OrderRepository.findByCustomerIdWithItemsAndProducts(customerId).
+  4. OrderRepository executes JPQL query:
+     "SELECT DISTINCT o FROM Order o JOIN FETCH o.orderItems oi JOIN FETCH oi.product WHERE o.customer.id = :customerId"
+  5. Hibernate translates JPQL into 1 single SQL statement executed on MySQL:
+     SELECT DISTINCT o.id, o.order_number, o.total_amount, o.status, o.order_date,
+            oi.id, oi.quantity, oi.unit_price, oi.subtotal,
+            p.id, p.name, p.sku, p.price
+     FROM orders o
+     INNER JOIN order_item oi ON o.id = oi.order_id
+     INNER JOIN product p ON oi.product_id = p.id
+     WHERE o.customer_id = ?;
+  6. Eliminates N+1 database round-trips down to 1 single JOIN fetch query.
+====================================================================================================

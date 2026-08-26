@@ -1,0 +1,15 @@
+target/
+.git
+.gitignore
+.mvn
+mvnw
+mvnw.cmd
+.settings
+.classpath
+.project
+bin
+HELP.md
+requestAndResponse.txt
+*.log
+Dockerfile
+.dockerignore
